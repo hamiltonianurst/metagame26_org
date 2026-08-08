@@ -1,0 +1,910 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Metagame 2026 — Org Chart</title>
+<style>html, body, #root { margin: 0; padding: 0; min-height: 100%; } body { background: #24402F; }</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+
+/* Storage shim: uses Claude's artifact storage when available, otherwise
+   the browser's localStorage (GitHub Pages, local file, etc). */
+const appStorage = (typeof window !== "undefined" && window.storage)
+  ? window.storage
+  : {
+      get: async (k) => {
+        const v = localStorage.getItem(k);
+        return v == null ? null : { key: k, value: v };
+      },
+      set: async (k, v) => {
+        localStorage.setItem(k, String(v));
+        return { key: k, value: v };
+      },
+    };
+
+const { useState, useEffect, useRef } = React;
+
+/* ---------- helpers ---------- */
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+/* Shared team palette — the Gantt chart uses the same eight colors */
+const TEAM_COLORS = ["#3E7CB1", "#6B4FA0", "#2E8B74", "#C2703D", "#B5486B", "#7A8B3F", "#4B6584", "#8A5A44"];
+
+const mkNode = (title, person = "", duties = [], children = [], color = "") => ({
+  id: uid(),
+  title,
+  person,
+  duties,
+  color, // team color — cascades to reports unless they set their own
+  comped: false, // paid beyond a free/partially comped ticket
+  collapsed: false,
+  children,
+});
+
+const seedTree = () =>
+  mkNode("Arbor, LLC", "Ricki Heicklen", ["Holds the purse strings — funding & finances"], [
+    mkNode("Project Lead", "Brendan Hurst", ["Overall coordination of the con", "Oversees all 8 team leads"], [
+      mkNode("Megagame Lead", "", ["Design & run the megagame"], [
+        mkNode("Megagame team / subteams", "", ["Structure TBD"]),
+      ], "#6B4FA0"),
+      mkNode("Operations Lead", "Brendan Hurst", [], [], "#4B6584"),
+      mkNode("Speaker / Program Lead", "Brendan Hurst", ["Curate talks & program"], [
+        mkNode("Speaker committee", "Ricki, Max", []),
+      ], "#3E7CB1"),
+      mkNode("Volunteer Lead", "", ["Recruit, schedule & support volunteers"], [
+        mkNode("Volunteers", "", []),
+      ], "#7A8B3F"),
+      mkNode("Venue Coordinator", "Brendan Hurst", ["Liaison with Lighthaven"], [
+        mkNode("Housing coordinator", "", []),
+        mkNode("Food coordinator", "", []),
+        mkNode("AV coordinator", "", []),
+        mkNode("Quartermaster", "", ["Ideally lives in the Bay Area", "Manages physical supplies & storage"]),
+        mkNode("Photographer", "", []),
+      ], "#C2703D"),
+      mkNode("Web Lead", "Brian Smiley", [], [
+        mkNode("Tech team", "", []),
+        mkNode("Design Team Lead", "Isabelle Watriss", []),
+      ], "#2E8B74"),
+      mkNode("Marketing Lead", "Max Morawski", [], [
+        mkNode("Sponsor coordinator", "", []),
+        mkNode("Budget keeper", "", []),
+        mkNode("Social media manager", "", ["Instagram", "Twitter"]),
+      ], "#B5486B"),
+      mkNode("Community Health Lead", "Damon Pourtahmaseb-Sasi (tentative)", [], [], "#8A5A44"),
+    ]),
+  ]);
+
+const mapTree = (node, fn) => {
+  const next = fn(node);
+  return { ...next, children: next.children.map((c) => mapTree(c, fn)) };
+};
+const removeById = (node, id) => ({
+  ...node,
+  children: node.children.filter((c) => c.id !== id).map((c) => removeById(c, id)),
+});
+const findById = (node, id) => {
+  if (node.id === id) return node;
+  for (const c of node.children) {
+    const hit = findById(c, id);
+    if (hit) return hit;
+  }
+  return null;
+};
+const countNodes = (n) => 1 + n.children.reduce((s, c) => s + countNodes(c), 0);
+
+const treeToText = (n, depth = 0) => {
+  const pad = "  ".repeat(depth);
+  const line = `${pad}- ${n.title}${n.person ? ` — ${n.person}` : " — (open)"}${n.comped ? " [$]" : ""}${n.color ? ` [${n.color}]` : ""}`;
+  const dutyLines = n.duties.map((d) => `${pad}    • ${d}`);
+  const kids = n.children.map((c) => treeToText(c, depth + 1));
+  return [line, ...dutyLines, ...kids].join("\n");
+};
+
+/* Parse the "Export outline" format back into { tree, extras }.
+   Node lines: "- Title — Person" (indented 2 spaces per level, "(open)" = unfilled, "[$]" = compensated)
+   Duty lines: "• duty" under their node.
+   A line starting with "Off-chart" switches to the flat off-chart roles list. */
+const parseOutline = (text) => {
+  const lines = text.split("\n").filter((l) => l.trim());
+  let root = null;
+  const extras = [];
+  const stack = []; // [{ depth, node }]
+  let lastNode = null;
+  let mode = "tree";
+  for (const raw of lines) {
+    const indent = raw.match(/^\s*/)[0].length;
+    const trimmed = raw.trim();
+    if (/^off-chart/i.test(trimmed)) {
+      mode = "extras";
+      continue;
+    }
+    if (trimmed.startsWith("•")) {
+      if (lastNode) lastNode.duties.push(trimmed.replace(/^•\s*/, ""));
+      continue;
+    }
+    if (!trimmed.startsWith("-")) continue;
+    let body = trimmed.replace(/^-\s*/, "");
+    let color = "";
+    const cm = body.match(/\[(#[0-9a-fA-F]{3,8})\]\s*$/);
+    if (cm) {
+      color = cm[1];
+      body = body.replace(/\s*\[#[0-9a-fA-F]{3,8}\]\s*$/, "");
+    }
+    let comped = false;
+    if (/\[\$\]\s*$/.test(body)) {
+      comped = true;
+      body = body.replace(/\s*\[\$\]\s*$/, "");
+    }
+    let title = body;
+    let person = "";
+    const sep = body.indexOf(" — ");
+    if (sep !== -1) {
+      title = body.slice(0, sep).trim();
+      person = body.slice(sep + 3).trim();
+      if (person === "(open)") person = "";
+    }
+    const node = { ...mkNode(title || "Untitled role", person), comped, color };
+    if (mode === "extras") {
+      extras.push(node);
+      lastNode = node;
+      continue;
+    }
+    const depth = Math.floor(indent / 2);
+    while (stack.length && stack[stack.length - 1].depth >= depth) stack.pop();
+    if (!stack.length) {
+      if (!root) root = node;
+      else root.children.push(node); // stray extra top-level lines become children of root
+      stack.push({ depth, node });
+    } else {
+      stack[stack.length - 1].node.children.push(node);
+      stack.push({ depth, node });
+    }
+    lastNode = node;
+  }
+  return root ? { tree: root, extras } : null;
+};
+
+const buildOutline = (tree, extras) => {
+  let out = treeToText(tree);
+  if (extras && extras.length) {
+    out += "\n\nOff-chart roles:\n" + extras.map((n) => treeToText(n, 0)).join("\n");
+  }
+  return out;
+};
+
+/* ---------- die-pip badge ---------- */
+
+const PIP_LAYOUTS = {
+  1: [[1, 1]],
+  2: [[0, 0], [2, 2]],
+  3: [[0, 0], [1, 1], [2, 2]],
+  4: [[0, 0], [0, 2], [2, 0], [2, 2]],
+  5: [[0, 0], [0, 2], [1, 1], [2, 0], [2, 2]],
+  6: [[0, 0], [0, 2], [1, 0], [1, 2], [2, 0], [2, 2]],
+};
+
+function DieBadge({ count }) {
+  if (count <= 0) return null;
+  const box = {
+    width: 18,
+    height: 18,
+    borderRadius: 4,
+    background: "#fff",
+    border: "1.5px solid var(--ink)",
+    flexShrink: 0,
+    display: "grid",
+    placeItems: "center",
+  };
+  if (count > 6) {
+    return (
+      <span title={`${count} direct reports`} style={{ ...box, fontFamily: "ui-monospace, monospace", fontSize: 10, fontWeight: 700, color: "var(--ink)" }}>
+        {count}
+      </span>
+    );
+  }
+  return (
+    <span title={`${count} direct report${count > 1 ? "s" : ""}`} style={box}>
+      <span style={{ display: "grid", gridTemplateColumns: "repeat(3, 3px)", gridTemplateRows: "repeat(3, 3px)", gap: 1 }}>
+        {Array.from({ length: 9 }).map((_, i) => {
+          const r = Math.floor(i / 3), c = i % 3;
+          const on = PIP_LAYOUTS[count].some(([pr, pc]) => pr === r && pc === c);
+          return <span key={i} style={{ width: 3, height: 3, borderRadius: "50%", background: on ? "var(--ink)" : "transparent" }} />;
+        })}
+      </span>
+    </span>
+  );
+}
+
+/* ---------- tree layout ---------- */
+
+const LINE = "rgba(250,247,240,0.42)";
+const STUB = 16;
+
+function TreeNode({ node, depth, showDuties, onSelect, onToggle, inheritedColor = "" }) {
+  const isRoot = depth === 0;
+  const open = !node.person;
+  const kids = node.children;
+  const showKids = kids.length > 0 && !node.collapsed;
+  const teamColor = node.color || inheritedColor;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+      {/* card */}
+      <div style={{ padding: "0 10px" }}>
+        <div
+          onClick={() => onSelect(node.id)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(node.id); } }}
+          style={{
+            background: "var(--card)",
+            border: isRoot
+              ? "2px solid var(--gold)"
+              : node.comped
+                ? "4px double var(--gold)"
+                : open
+                  ? "2px dashed var(--red)"
+                  : "1.5px solid rgba(34,38,31,0.22)",
+            borderRadius: 9,
+            boxShadow: "0 2px 0 rgba(0,0,0,0.3)",
+            padding: "9px 12px",
+            minWidth: 120,
+            maxWidth: 190,
+            cursor: "pointer",
+            textAlign: "center",
+            userSelect: "none",
+          }}
+        >
+          {teamColor && !isRoot && (
+            <div style={{ height: 5, borderRadius: 99, background: teamColor, margin: "0 0 7px" }} />
+          )}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+            <span style={{ fontFamily: "var(--display)", fontWeight: 800, fontSize: isRoot ? 15 : 13, color: "var(--ink)", lineHeight: 1.2 }}>
+              {node.title}
+            </span>
+            {node.comped && !isRoot && (
+              <span
+                title="Compensated beyond a comped ticket"
+                style={{
+                  width: 16,
+                  height: 16,
+                  borderRadius: "50%",
+                  background: "var(--gold)",
+                  color: "#fff",
+                  fontSize: 10.5,
+                  fontWeight: 800,
+                  display: "grid",
+                  placeItems: "center",
+                  flexShrink: 0,
+                }}
+              >
+                $
+              </span>
+            )}
+            <DieBadge count={kids.length} />
+          </div>
+          <div style={{ marginTop: 3, fontSize: 12, lineHeight: 1.3 }}>
+            {open ? (
+              <span style={{ color: "var(--red)", fontWeight: 700, fontSize: 10.5, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+                Open role
+              </span>
+            ) : (
+              <span style={{ color: "var(--ink)" }}>{node.person}</span>
+            )}
+          </div>
+          {showDuties && node.duties.length > 0 && (
+            <ul style={{ margin: "6px 0 0", paddingLeft: 14, textAlign: "left", color: "var(--muted)", fontSize: 10.5, lineHeight: 1.45 }}>
+              {node.duties.map((d, i) => (
+                <li key={i}>{d}</li>
+              ))}
+            </ul>
+          )}
+          {kids.length > 0 && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onToggle(node.id); }}
+              aria-label={node.collapsed ? "Expand reports" : "Collapse reports"}
+              style={{
+                marginTop: 6,
+                background: "transparent",
+                border: "1px solid rgba(34,38,31,0.25)",
+                borderRadius: 5,
+                fontSize: 10,
+                fontWeight: 700,
+                color: "var(--muted)",
+                cursor: "pointer",
+                padding: "2px 8px",
+              }}
+            >
+              {node.collapsed ? `▸ show ${kids.length}` : "▾ hide"}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* connectors + children */}
+      {showKids && (
+        <>
+          <div style={{ width: 2, height: STUB, background: LINE }} />
+          <div style={{ display: "flex", alignItems: "flex-start" }}>
+            {kids.map((c, i) => (
+              <div key={c.id} style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                <div style={{ display: "flex", width: "100%", height: 2 }}>
+                  <div style={{ flex: 1, background: i === 0 ? "transparent" : LINE, height: 2 }} />
+                  <div style={{ flex: 1, background: i === kids.length - 1 ? "transparent" : LINE, height: 2 }} />
+                </div>
+                <div style={{ width: 2, height: STUB, background: LINE }} />
+                <TreeNode node={c} depth={depth + 1} showDuties={showDuties} onSelect={onSelect} onToggle={onToggle} inheritedColor={teamColor} />
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ---------- editor modal ---------- */
+
+function EditorModal({ node, isRoot, allowChildren, onSave, onAddChild, onDelete, onClose }) {
+  const [title, setTitle] = useState(node.title);
+  const [person, setPerson] = useState(node.person);
+  const [duties, setDuties] = useState(node.duties.join("\n"));
+  const [comped, setComped] = useState(!!node.comped);
+  const [color, setColor] = useState(node.color || "");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const titleRef = useRef(null);
+  useEffect(() => { titleRef.current?.focus(); }, []);
+
+  const commit = () => ({
+    title: title.trim() || "Untitled role",
+    person: person.trim(),
+    duties: duties.split("\n").map((d) => d.trim()).filter(Boolean),
+    comped,
+    color,
+  });
+
+  const inputStyle = {
+    width: "100%",
+    boxSizing: "border-box",
+    border: "1.5px solid var(--line)",
+    borderRadius: 6,
+    padding: "8px 10px",
+    fontSize: 14,
+    fontFamily: "inherit",
+    background: "#fff",
+    color: "var(--ink)",
+    outline: "none",
+  };
+  const labelStyle = {
+    fontSize: 10.5,
+    letterSpacing: "0.08em",
+    textTransform: "uppercase",
+    fontWeight: 700,
+    color: "var(--muted)",
+    display: "block",
+    marginBottom: 4,
+  };
+  const btnBase = { border: "none", borderRadius: 6, padding: "9px 14px", fontSize: 13.5, fontWeight: 700, cursor: "pointer" };
+
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: "fixed", inset: 0, background: "rgba(15,25,19,0.6)", display: "grid", placeItems: "center", padding: 16, zIndex: 50 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ background: "var(--card)", borderRadius: 12, padding: 18, width: "100%", maxWidth: 360, boxShadow: "0 10px 30px rgba(0,0,0,0.4)" }}
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div>
+            <label style={labelStyle}>Role</label>
+            <input ref={titleRef} style={inputStyle} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Role title" />
+          </div>
+          <div>
+            <label style={labelStyle}>Who</label>
+            <input style={inputStyle} value={person} onChange={(e) => setPerson(e.target.value)} placeholder="Leave blank if open" />
+          </div>
+          <div>
+            <label style={labelStyle}>Duties — one per line</label>
+            <textarea
+              style={{ ...inputStyle, minHeight: 84, resize: "vertical" }}
+              value={duties}
+              onChange={(e) => setDuties(e.target.value)}
+              placeholder={"e.g.\nRun weekly check-ins\nOwn the budget sheet"}
+            />
+          </div>
+          <div>
+            <label style={labelStyle}>Team color — flows down to reports unless they set their own</label>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              <button
+                onClick={() => setColor("")}
+                title="No color (inherit from parent)"
+                style={{
+                  width: 26, height: 26, borderRadius: "50%", cursor: "pointer",
+                  background: "#fff",
+                  border: color === "" ? "2.5px solid var(--ink)" : "1.5px solid var(--line)",
+                  fontSize: 11, color: "var(--muted)", padding: 0,
+                }}
+              >
+                ✕
+              </button>
+              {TEAM_COLORS.map((c) => (
+                <button
+                  key={c}
+                  onClick={() => setColor(c)}
+                  title={c}
+                  style={{
+                    width: 26, height: 26, borderRadius: "50%", cursor: "pointer",
+                    background: c,
+                    border: color === c ? "2.5px solid var(--ink)" : "1.5px solid rgba(34,38,31,0.25)",
+                    padding: 0,
+                  }}
+                />
+              ))}
+              <input
+                type="color"
+                value={/^#[0-9a-fA-F]{6}$/.test(color) ? color : "#888888"}
+                onChange={(e) => setColor(e.target.value)}
+                title="Custom color"
+                style={{ width: 30, height: 28, border: "1.5px solid var(--line)", borderRadius: 6, background: "#fff", cursor: "pointer", padding: 1 }}
+              />
+            </div>
+          </div>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 13.5, color: "var(--ink)", userSelect: "none" }}>
+            <input
+              type="checkbox"
+              checked={comped}
+              onChange={(e) => setComped(e.target.checked)}
+              style={{ width: 16, height: 16, accentColor: "#C99A3C", cursor: "pointer" }}
+            />
+            <span>
+              <strong>Compensated role</strong>
+              <span style={{ color: "var(--muted)" }}> — paid beyond a free/comped ticket</span>
+            </span>
+          </label>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button style={{ ...btnBase, background: "var(--ink)", color: "var(--card)" }} onClick={() => onSave(commit())}>
+              Save changes
+            </button>
+            {allowChildren && (
+              <button style={{ ...btnBase, background: "transparent", color: "var(--ink)", border: "1.5px solid var(--line)" }} onClick={() => onAddChild(commit())}>
+                + Add report
+              </button>
+            )}
+            <button style={{ ...btnBase, background: "transparent", color: "var(--muted)", border: "1.5px solid var(--line)" }} onClick={onClose}>
+              Cancel
+            </button>
+          </div>
+          {!isRoot && (
+            <div style={{ borderTop: "1px dashed rgba(34,38,31,0.2)", paddingTop: 10 }}>
+              {confirmDelete ? (
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 13, color: "var(--red)", fontWeight: 700 }}>
+                    Delete this role{node.children.length > 0 ? ` and the ${countNodes(node) - 1} below it` : ""}?
+                  </span>
+                  <button style={{ ...btnBase, background: "var(--red)", color: "#fff" }} onClick={onDelete}>Yes, delete</button>
+                  <button style={{ ...btnBase, background: "transparent", color: "var(--muted)", border: "1.5px solid var(--line)" }} onClick={() => setConfirmDelete(false)}>No</button>
+                </div>
+              ) : (
+                <button style={{ ...btnBase, background: "transparent", color: "var(--red)", border: "none", padding: "4px 0" }} onClick={() => setConfirmDelete(true)}>
+                  Delete this role…
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- app ---------- */
+
+const STORAGE_KEY = "metagame_org_chart_v1";
+
+function OrgTree() {
+  const [tree, setTree] = useState(null);
+  const [extras, setExtras] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [zoom, setZoom] = useState(1);
+  const [showDuties, setShowDuties] = useState(false);
+  const [status, setStatus] = useState("loading");
+  const [copied, setCopied] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importError, setImportError] = useState("");
+  const [outlineOpen, setOutlineOpen] = useState(false);
+  const outlineRef = useRef(null);
+  const saveTimer = useRef(null);
+  const loaded = useRef(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await appStorage.get(STORAGE_KEY);
+        if (result && result.value) {
+          const parsed = JSON.parse(result.value);
+          if (parsed && parsed.tree) {
+            setTree(parsed.tree);
+            setExtras(parsed.extras || []);
+          } else {
+            setTree(parsed); // legacy tree-only save
+          }
+        } else {
+          setTree(seedTree());
+        }
+      } catch {
+        setTree(seedTree());
+      }
+      loaded.current = true;
+      setStatus("ready");
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded.current || !tree) return;
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await appStorage.set(STORAGE_KEY, JSON.stringify({ tree, extras }));
+        setStatus("ready");
+      } catch {
+        setStatus("unsaved-warning");
+      }
+    }, 500);
+    return () => clearTimeout(saveTimer.current);
+  }, [tree, extras]);
+
+  const update = (id, patch) => {
+    setTree((t) => mapTree(t, (n) => (n.id === id ? { ...n, ...patch } : n)));
+    setExtras((ex) => ex.map((n) => (n.id === id ? { ...n, ...patch } : n)));
+  };
+  const toggle = (id) => setTree((t) => mapTree(t, (n) => (n.id === id ? { ...n, collapsed: !n.collapsed } : n)));
+
+  const addExtra = () => {
+    const node = mkNode("New off-chart role");
+    setExtras((ex) => [...ex, node]);
+    setSelectedId(node.id);
+  };
+
+  const addChildTo = (parentId, parentPatch) => {
+    const child = mkNode("New role");
+    setTree((t) =>
+      mapTree(t, (n) =>
+        n.id === parentId
+          ? { ...n, ...(parentPatch || {}), collapsed: false, children: [...n.children, child] }
+          : n
+      )
+    );
+    setSelectedId(child.id);
+  };
+
+  const del = (id) => {
+    setTree((t) => removeById(t, id));
+    setExtras((ex) => ex.filter((n) => n.id !== id));
+    setSelectedId(null);
+  };
+
+  const tryCopyOutline = async () => {
+    const text = buildOutline(tree, extras);
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch {
+      // clipboard API blocked — fall back to selecting the textarea and execCommand
+      try {
+        if (outlineRef.current) {
+          outlineRef.current.focus();
+          outlineRef.current.select();
+          ok = document.execCommand("copy");
+        }
+      } catch { ok = false; }
+    }
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } else if (outlineRef.current) {
+      outlineRef.current.focus();
+      outlineRef.current.select();
+    }
+  };
+
+  const runImport = () => {
+    const parsed = parseOutline(importText);
+    if (!parsed) {
+      setImportError("Couldn't find any roles in that text — paste the outline copied from the chart.");
+      return;
+    }
+    setTree(parsed.tree);
+    setExtras(parsed.extras);
+    setImportOpen(false);
+    setImportText("");
+    setImportError("");
+    setSelectedId(null);
+  };
+
+  const reset = () => {
+    setTree(seedTree());
+    setExtras([]);
+    setSelectedId(null);
+    setConfirmReset(false);
+  };
+
+  if (!tree) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#24402F", color: "#FAF7F0", fontFamily: "system-ui, sans-serif" }}>
+        Setting up the table…
+      </div>
+    );
+  }
+
+  const selected = selectedId ? (findById(tree, selectedId) || extras.find((n) => n.id === selectedId) || null) : null;
+  const selectedIsExtra = !!(selectedId && extras.some((n) => n.id === selectedId));
+  const smallBtn = {
+    background: "transparent",
+    color: "var(--paper)",
+    border: "1.5px solid rgba(250,247,240,0.35)",
+    borderRadius: 6,
+    padding: "6px 11px",
+    fontSize: 12.5,
+    fontWeight: 600,
+    cursor: "pointer",
+  };
+
+  return (
+    <div
+      style={{
+        "--felt": "#24402F",
+        "--card": "#FAF7F0",
+        "--paper": "#FAF7F0",
+        "--ink": "#22261F",
+        "--muted": "#5C6657",
+        "--red": "#BC4B33",
+        "--gold": "#C99A3C",
+        "--line": "rgba(34,38,31,0.25)",
+        "--display": "'Archivo', 'Avenir Next', 'Segoe UI', system-ui, sans-serif",
+        minHeight: "100vh",
+        background: "var(--felt)",
+        backgroundImage: "radial-gradient(rgba(255,255,255,0.045) 1px, transparent 1px)",
+        backgroundSize: "22px 22px",
+        fontFamily: "'Public Sans', 'Segoe UI', system-ui, sans-serif",
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@700;800&family=Public+Sans:wght@400;600;700&display=swap');
+        button:focus-visible, input:focus-visible, textarea:focus-visible, [role="button"]:focus-visible { outline: 2px solid #C99A3C; outline-offset: 1px; }
+        @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+      `}</style>
+
+      {/* header */}
+      <header style={{ color: "var(--paper)", padding: "22px 16px 14px", maxWidth: 900, width: "100%", margin: "0 auto", boxSizing: "border-box" }}>
+        <div style={{ fontSize: 11, letterSpacing: "0.22em", textTransform: "uppercase", opacity: 0.75, fontWeight: 700 }}>
+          Metagame 2026
+        </div>
+        <h1 style={{ fontFamily: "var(--display)", fontWeight: 800, fontSize: 26, margin: "3px 0 4px", lineHeight: 1.1 }}>
+          Who's at the table
+        </h1>
+        <p style={{ margin: 0, fontSize: 13, opacity: 0.8, lineHeight: 1.5 }}>
+          Tap any card to edit it, add reports beneath it, or remove it. Scroll and zoom to explore — everything saves automatically.
+        </p>
+        <div style={{ display: "flex", gap: 14, marginTop: 8, flexWrap: "wrap", fontSize: 11.5, opacity: 0.85 }}>
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ width: 14, height: 14, border: "3px double var(--gold)", borderRadius: 4, background: "var(--paper)", display: "inline-block" }} />
+            Compensated beyond a comped ticket
+          </span>
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ width: 14, height: 14, border: "2px dashed var(--red)", borderRadius: 4, background: "var(--paper)", display: "inline-block" }} />
+            Open role
+          </span>
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ display: "flex", gap: 4, alignItems: "center" }}>
+            <button style={smallBtn} aria-label="Zoom out" onClick={() => setZoom((z) => Math.max(0.4, +(z - 0.15).toFixed(2)))}>−</button>
+            <button style={{ ...smallBtn, minWidth: 52 }} onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button>
+            <button style={smallBtn} aria-label="Zoom in" onClick={() => setZoom((z) => Math.min(1.6, +(z + 0.15).toFixed(2)))}>+</button>
+          </span>
+          <button style={{ ...smallBtn, ...(showDuties ? { background: "var(--paper)", color: "var(--ink)" } : {}) }} onClick={() => setShowDuties((s) => !s)}>
+            {showDuties ? "Duties on" : "Show duties"}
+          </button>
+          <button style={smallBtn} onClick={() => setOutlineOpen(true)}>Export outline</button>
+          <button style={smallBtn} onClick={() => { setImportOpen(true); setImportError(""); }}>Import outline</button>
+          {confirmReset ? (
+            <span style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12.5 }}>
+              <span>Discard all changes?</span>
+              <button style={{ ...smallBtn, background: "var(--red)", borderColor: "var(--red)", color: "#fff" }} onClick={reset}>Reset</button>
+              <button style={smallBtn} onClick={() => setConfirmReset(false)}>Keep</button>
+            </span>
+          ) : (
+            <button style={smallBtn} onClick={() => setConfirmReset(true)}>Reset</button>
+          )}
+          {typeof window !== "undefined" && !window.storage && (
+            <a href="metagame-gantt.html" style={{ ...smallBtn, textDecoration: "none", display: "inline-block", boxSizing: "border-box" }}>
+              Gantt chart →
+            </a>
+          )}
+          {status === "unsaved-warning" && (
+            <span style={{ fontSize: 12, color: "#F0C9A8" }}>Couldn't save — changes live only in this session</span>
+          )}
+        </div>
+      </header>
+
+      {/* tree canvas */}
+      <div style={{ flex: 1, overflow: "auto", padding: "10px 16px 60px", WebkitOverflowScrolling: "touch" }}>
+        <div style={{ zoom: zoom, width: "max-content", minWidth: "100%", display: "flex", flexDirection: "column", alignItems: "center" }}>
+          <TreeNode node={tree} depth={0} showDuties={showDuties} onSelect={setSelectedId} onToggle={toggle} />
+
+          {/* off-chart roles shelf */}
+          <div style={{ marginTop: 40, width: "100%", maxWidth: 700 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+              <span style={{ flex: 1, height: 1, background: "rgba(250,247,240,0.25)" }} />
+              <span style={{ color: "var(--paper)", fontSize: 11, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase", opacity: 0.85 }}>
+                Off-chart roles
+              </span>
+              <span style={{ flex: 1, height: 1, background: "rgba(250,247,240,0.25)" }} />
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: 10, alignItems: "flex-start" }}>
+              {extras.map((n) => (
+                <TreeNode key={n.id} node={n} depth={1} showDuties={showDuties} onSelect={setSelectedId} onToggle={toggle} />
+              ))}
+              <button
+                onClick={addExtra}
+                style={{
+                  background: "transparent",
+                  border: "2px dashed rgba(250,247,240,0.4)",
+                  borderRadius: 9,
+                  color: "var(--paper)",
+                  fontSize: 12.5,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                  padding: "16px 18px",
+                  minWidth: 120,
+                }}
+              >
+                + Add role
+              </button>
+            </div>
+            <p style={{ margin: "10px auto 0", maxWidth: 420, textAlign: "center", color: "var(--paper)", opacity: 0.6, fontSize: 11.5, lineHeight: 1.5 }}>
+              For roles that don't report to anyone on the chart — external points of contact, generalists, advisors.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {outlineOpen && (
+        <div
+          onClick={() => setOutlineOpen(false)}
+          style={{ position: "fixed", inset: 0, background: "rgba(15,25,19,0.6)", display: "grid", placeItems: "center", padding: 16, zIndex: 50 }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ background: "var(--card)", borderRadius: 12, padding: 18, width: "100%", maxWidth: 420, boxShadow: "0 10px 30px rgba(0,0,0,0.4)" }}
+          >
+            <div style={{ fontFamily: "var(--display)", fontWeight: 800, fontSize: 16, color: "var(--ink)", marginBottom: 6 }}>
+              Chart as outline
+            </div>
+            <p style={{ margin: "0 0 10px", fontSize: 13, color: "var(--muted)", lineHeight: 1.5 }}>
+              Tap "Copy", or select the text below and copy it yourself if the button doesn't take.
+            </p>
+            <textarea
+              ref={outlineRef}
+              readOnly
+              value={buildOutline(tree, extras)}
+              onFocus={(e) => e.target.select()}
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                minHeight: 220,
+                border: "1.5px solid var(--line)",
+                borderRadius: 6,
+                padding: "8px 10px",
+                fontSize: 12.5,
+                fontFamily: "ui-monospace, monospace",
+                background: "#fff",
+                color: "var(--ink)",
+                resize: "vertical",
+                outline: "none",
+              }}
+            />
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <button
+                onClick={tryCopyOutline}
+                style={{ background: "var(--ink)", color: "var(--card)", border: "none", borderRadius: 6, padding: "9px 14px", fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}
+              >
+                {copied ? "Copied ✓" : "Copy"}
+              </button>
+              <button
+                onClick={() => setOutlineOpen(false)}
+                style={{ background: "transparent", color: "var(--muted)", border: "1.5px solid var(--line)", borderRadius: 6, padding: "9px 14px", fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {importOpen && (
+        <div
+          onClick={() => setImportOpen(false)}
+          style={{ position: "fixed", inset: 0, background: "rgba(15,25,19,0.6)", display: "grid", placeItems: "center", padding: 16, zIndex: 50 }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ background: "var(--card)", borderRadius: 12, padding: 18, width: "100%", maxWidth: 420, boxShadow: "0 10px 30px rgba(0,0,0,0.4)" }}
+          >
+            <div style={{ fontFamily: "var(--display)", fontWeight: 800, fontSize: 16, color: "var(--ink)", marginBottom: 6 }}>
+              Import an outline
+            </div>
+            <p style={{ margin: "0 0 10px", fontSize: 13, color: "var(--muted)", lineHeight: 1.5 }}>
+              Paste an outline copied from any version of this chart ("Copy as outline"). This replaces the whole chart with what you paste.
+            </p>
+            <textarea
+              value={importText}
+              onChange={(e) => setImportText(e.target.value)}
+              placeholder={"- Arbor, LLC — Ricki Heicklen\n  - Project Lead — Brendan Hurst\n      • Overall coordination"}
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                minHeight: 180,
+                border: "1.5px solid var(--line)",
+                borderRadius: 6,
+                padding: "8px 10px",
+                fontSize: 12.5,
+                fontFamily: "ui-monospace, monospace",
+                background: "#fff",
+                color: "var(--ink)",
+                resize: "vertical",
+                outline: "none",
+              }}
+            />
+            {importError && (
+              <div style={{ marginTop: 8, fontSize: 12.5, color: "var(--red)", fontWeight: 600 }}>{importError}</div>
+            )}
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <button
+                onClick={runImport}
+                style={{ background: "var(--ink)", color: "var(--card)", border: "none", borderRadius: 6, padding: "9px 14px", fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}
+              >
+                Replace chart with this
+              </button>
+              <button
+                onClick={() => setImportOpen(false)}
+                style={{ background: "transparent", color: "var(--muted)", border: "1.5px solid var(--line)", borderRadius: 6, padding: "9px 14px", fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selected && (
+        <EditorModal
+          node={selected}
+          isRoot={selected.id === tree.id}
+          allowChildren={!selectedIsExtra}
+          onSave={(patch) => { update(selected.id, patch); setSelectedId(null); }}
+          onAddChild={(patch) => addChildTo(selected.id, patch)}
+          onDelete={() => del(selected.id)}
+          onClose={() => setSelectedId(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<OrgTree />);
+</script>
+</body>
+</html>
