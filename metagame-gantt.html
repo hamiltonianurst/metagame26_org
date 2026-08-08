@@ -18,7 +18,7 @@
 const appStorage = (typeof window !== "undefined" && window.storage)
   ? window.storage
   : {
-      get: async (k) => {
+      get: async (k) => {x
         const v = localStorage.getItem(k);
         return v == null ? null : { key: k, value: v };
       },
@@ -505,7 +505,7 @@ function GanttChart() {
             <button style={smallBtn} onClick={() => setConfirmReset(true)}>Reset</button>
           )}
           {typeof window !== "undefined" && !window.storage && (
-            <a href="metagame-org-chart.html" style={{ ...smallBtn, textDecoration: "none", display: "inline-block", boxSizing: "border-box" }}>
+            <a href="index.html" style={{ ...smallBtn, textDecoration: "none", display: "inline-block", boxSizing: "border-box" }}>
               Org chart →
             </a>
           )}
